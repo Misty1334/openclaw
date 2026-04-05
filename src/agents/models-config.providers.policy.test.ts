@@ -1,9 +1,11 @@
 import { describe, expect, it } from "vitest";
+import {
+  normalizeProviderSpecificConfig,
+  resolveProviderConfigApiKeyResolver,
+} from "./models-config.providers.policy.js";
 
 describe("models-config.providers.policy", () => {
   it("resolves config apiKey markers through provider plugin hooks", async () => {
-    const { resolveProviderConfigApiKeyResolver } =
-      await import("./models-config.providers.policy.js");
     const env = {
       AWS_PROFILE: "default",
     } as NodeJS.ProcessEnv;
@@ -14,8 +16,6 @@ describe("models-config.providers.policy", () => {
   });
 
   it("resolves anthropic-vertex ADC markers through provider plugin hooks", async () => {
-    const { resolveProviderConfigApiKeyResolver } =
-      await import("./models-config.providers.policy.js");
     const resolver = resolveProviderConfigApiKeyResolver("anthropic-vertex");
 
     expect(resolver).toBeTypeOf("function");
@@ -27,8 +27,6 @@ describe("models-config.providers.policy", () => {
   });
 
   it("normalizes Google provider config through provider plugin hooks", async () => {
-    const { normalizeProviderSpecificConfig } = await import("./models-config.providers.policy.js");
-
     expect(
       normalizeProviderSpecificConfig("google", {
         api: "google-generative-ai",
@@ -39,5 +37,17 @@ describe("models-config.providers.policy", () => {
       api: "google-generative-ai",
       baseUrl: "https://generativelanguage.googleapis.com/v1beta",
     });
+  });
+
+  it("does not treat generic transport APIs as provider plugin ids", () => {
+    const provider = {
+      api: "openai-completions" as const,
+      baseUrl: "https://example.invalid/v1",
+      apiKey: "EXAMPLE_KEY",
+      models: [],
+    };
+
+    expect(resolveProviderConfigApiKeyResolver("dashscope-vision", provider)).toBeUndefined();
+    expect(normalizeProviderSpecificConfig("dashscope-vision", provider)).toBe(provider);
   });
 });

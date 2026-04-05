@@ -1,9 +1,10 @@
+import { EventEmitter } from "node:events";
 import fsSync from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { describe, expect, it } from "vitest";
-import { runNodeMain } from "../../scripts/run-node.mjs";
+import { describe, expect, it, vi } from "vitest";
+import { resolveBuildRequirement, runNodeMain } from "../../scripts/run-node.mjs";
 import {
   bundledDistPluginFile,
   bundledPluginFile,
@@ -52,6 +53,13 @@ function createExitedProcess(code: number | null, signal: string | null = null) 
       return undefined;
     },
   };
+}
+
+function createFakeProcess() {
+  return Object.assign(new EventEmitter(), {
+    pid: 4242,
+    execPath: process.execPath,
+  }) as unknown as NodeJS.Process;
 }
 
 async function writeRuntimePostBuildScaffold(tmp: string): Promise<void> {
@@ -129,6 +137,41 @@ function createSpawnRecorder(
     return { status: 1, stdout: "" };
   };
   return { spawnCalls, spawn, spawnSync };
+}
+
+function createBuildRequirementDeps(
+  tmp: string,
+  options: {
+    gitHead?: string;
+    gitStatus?: string;
+    env?: Record<string, string>;
+  } = {},
+) {
+  const { spawnSync } = createSpawnRecorder({
+    gitHead: options.gitHead,
+    gitStatus: options.gitStatus,
+  });
+  return {
+    cwd: tmp,
+    env: {
+      ...process.env,
+      ...options.env,
+    },
+    fs: fsSync,
+    spawnSync,
+    distRoot: path.join(tmp, "dist"),
+    distEntry: path.join(tmp, DIST_ENTRY),
+    buildStampPath: path.join(tmp, BUILD_STAMP),
+    sourceRoots: [path.join(tmp, "src"), path.join(tmp, bundledPluginRoot("demo"))].map(
+      (sourceRoot) => ({
+        name: path.relative(tmp, sourceRoot).replaceAll("\\", "/"),
+        path: sourceRoot,
+      }),
+    ),
+    configFiles: [ROOT_TSCONFIG, ROOT_PACKAGE, ROOT_TSDOWN].map((filePath) =>
+      path.join(tmp, filePath),
+    ),
+  };
 }
 
 async function runStatusCommand(params: {
@@ -306,6 +349,69 @@ describe("run-node script", () => {
     });
   });
 
+  it("forwards wrapper SIGTERM to the active openclaw child and returns 143", async () => {
+    await withTempDir(async (tmp) => {
+      await setupTrackedProject(tmp, {
+        files: {
+          [ROOT_SRC]: "export const value = 1;\n",
+        },
+        oldPaths: [ROOT_SRC, ROOT_TSCONFIG, ROOT_PACKAGE],
+        buildPaths: [DIST_ENTRY, BUILD_STAMP],
+      });
+
+      const fakeProcess = createFakeProcess();
+      const child = Object.assign(new EventEmitter(), {
+        kill: vi.fn((signal: string) => {
+          queueMicrotask(() => child.emit("exit", 0, null));
+          return signal;
+        }),
+      });
+      const spawn = vi.fn<
+        (
+          cmd: string,
+          args: string[],
+          options: unknown,
+        ) => {
+          kill: (signal?: string) => boolean;
+          on: (event: "exit", cb: (code: number | null, signal: string | null) => void) => void;
+        }
+      >(() => ({
+        kill: (signal) => {
+          child.kill(String(signal ?? "SIGTERM"));
+          return true;
+        },
+        on: (event, cb) => {
+          child.on(event, cb);
+        },
+      }));
+
+      const exitCodePromise = runNodeMain({
+        cwd: tmp,
+        args: ["status"],
+        env: {
+          ...process.env,
+          OPENCLAW_RUNNER_LOG: "0",
+        },
+        process: fakeProcess,
+        spawn,
+        execPath: process.execPath,
+      });
+
+      fakeProcess.emit("SIGTERM");
+      const exitCode = await exitCodePromise;
+
+      expect(exitCode).toBe(143);
+      expect(spawn).toHaveBeenCalledWith(
+        process.execPath,
+        ["openclaw.mjs", "status"],
+        expect.objectContaining({ stdio: "inherit" }),
+      );
+      expect(child.kill).toHaveBeenCalledWith("SIGTERM");
+      expect(fakeProcess.listenerCount("SIGINT")).toBe(0);
+      expect(fakeProcess.listenerCount("SIGTERM")).toBe(0);
+    });
+  });
+
   it("rebuilds when extension sources are newer than the build stamp", async () => {
     await withTempDir(async (tmp) => {
       await setupTrackedProject(tmp, {
@@ -430,6 +536,53 @@ describe("run-node script", () => {
       expect(exitCode).toBe(0);
       expect(spawnCalls).toEqual([statusCommandSpawn()]);
       await expectManifestId(tmp, DIST_EXTENSION_MANIFEST, "demo");
+    });
+  });
+
+  it("reports dirty watched source trees as an explicit build reason", async () => {
+    await withTempDir(async (tmp) => {
+      await setupTrackedProject(tmp, {
+        files: {
+          [ROOT_SRC]: "export const value = 1;\n",
+        },
+        buildPaths: [ROOT_SRC, ROOT_TSCONFIG, ROOT_PACKAGE, DIST_ENTRY, BUILD_STAMP],
+      });
+
+      const requirement = resolveBuildRequirement(
+        createBuildRequirementDeps(tmp, {
+          gitHead: "abc123\n",
+          gitStatus: ` M ${ROOT_SRC}\n`,
+        }),
+      );
+
+      expect(requirement).toEqual({
+        shouldBuild: true,
+        reason: "dirty_watched_tree",
+      });
+    });
+  });
+
+  it("reports a clean tree explicitly when dist is current", async () => {
+    await withTempDir(async (tmp) => {
+      await setupTrackedProject(tmp, {
+        files: {
+          [ROOT_SRC]: "export const value = 1;\n",
+        },
+        oldPaths: [ROOT_SRC, ROOT_TSCONFIG, ROOT_PACKAGE],
+        buildPaths: [DIST_ENTRY, BUILD_STAMP],
+      });
+
+      const requirement = resolveBuildRequirement(
+        createBuildRequirementDeps(tmp, {
+          gitHead: "abc123\n",
+          gitStatus: "",
+        }),
+      );
+
+      expect(requirement).toEqual({
+        shouldBuild: false,
+        reason: "clean",
+      });
     });
   });
 

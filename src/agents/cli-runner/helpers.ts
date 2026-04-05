@@ -8,7 +8,9 @@ import { KeyedAsyncQueue } from "openclaw/plugin-sdk/keyed-async-queue";
 import type { ThinkLevel } from "../../auto-reply/thinking.js";
 import type { OpenClawConfig } from "../../config/config.js";
 import type { CliBackendConfig } from "../../config/types.js";
+import { resolvePreferredOpenClawTmpDir } from "../../infra/tmp-openclaw-dir.js";
 import { MAX_IMAGE_BYTES } from "../../media/constants.js";
+import { extensionForMime } from "../../media/mime.js";
 import { buildTtsSystemPromptHint } from "../../tts/tts.js";
 import { buildModelAliasLines } from "../model-alias-lines.js";
 import { resolveDefaultModelForAgent } from "../model-selection.js";
@@ -17,6 +19,7 @@ import type { EmbeddedContextFile } from "../pi-embedded-helpers.js";
 import { detectImageReferences, loadImageFromRef } from "../pi-embedded-runner/run/images.js";
 import type { SandboxFsBridge } from "../sandbox/fs-bridge.js";
 import { detectRuntimeShell } from "../shell-utils.js";
+import { stripSystemPromptCacheBoundary } from "../system-prompt-cache-boundary.js";
 import { buildSystemPromptParams } from "../system-prompt-params.js";
 import { buildAgentSystemPrompt } from "../system-prompt.js";
 import { sanitizeImageBlocks } from "../tool-images.js";
@@ -25,6 +28,19 @@ export { buildCliSupervisorScopeKey, resolveCliNoOutputTimeoutMs } from "./relia
 const CLI_RUN_QUEUE = new KeyedAsyncQueue();
 export function enqueueCliRun<T>(key: string, task: () => Promise<T>): Promise<T> {
   return CLI_RUN_QUEUE.enqueue(key, task);
+}
+
+export function resolveCliRunQueueKey(params: {
+  backendId: string;
+  serialize?: boolean;
+  runId: string;
+  workspaceDir: string;
+  cliSessionId?: string;
+}): string {
+  if (params.serialize === false) {
+    return `${params.backendId}:${params.runId}`;
+  }
+  return params.backendId;
 }
 
 export function buildSystemPrompt(params: {
@@ -39,6 +55,7 @@ export function buildSystemPrompt(params: {
   contextFiles?: EmbeddedContextFile[];
   modelDisplay: string;
   agentId?: string;
+  backendId?: string;
 }) {
   const defaultModelRef = resolveDefaultModelForAgent({
     cfg: params.config ?? {},
@@ -62,7 +79,7 @@ export function buildSystemPrompt(params: {
   });
   const ttsHint = params.config ? buildTtsSystemPromptHint(params.config) : undefined;
   const ownerDisplay = resolveOwnerDisplaySetting(params.config);
-  return buildAgentSystemPrompt({
+  const prompt = buildAgentSystemPrompt({
     workspaceDir: params.workspaceDir,
     defaultThinkLevel: params.defaultThinkLevel,
     extraSystemPrompt: params.extraSystemPrompt,
@@ -83,6 +100,7 @@ export function buildSystemPrompt(params: {
     ttsHint,
     memoryCitationsMode: params.config?.memory?.citations,
   });
+  return prompt;
 }
 
 export function normalizeCliModel(modelId: string, backend: CliBackendConfig): string {
@@ -156,21 +174,15 @@ export function resolvePromptInput(params: { backend: CliBackendConfig; prompt: 
   return { argsPrompt: params.prompt };
 }
 
-function resolveImageExtension(mimeType: string): string {
-  const normalized = mimeType.toLowerCase();
-  if (normalized.includes("png")) {
-    return "png";
-  }
-  if (normalized.includes("jpeg") || normalized.includes("jpg")) {
-    return "jpg";
-  }
-  if (normalized.includes("gif")) {
-    return "gif";
-  }
-  if (normalized.includes("webp")) {
-    return "webp";
-  }
-  return "bin";
+function resolveCliImagePath(image: ImageContent): string {
+  const ext = extensionForMime(image.mimeType) ?? ".bin";
+  const digest = crypto
+    .createHash("sha256")
+    .update(image.mimeType)
+    .update("\0")
+    .update(image.data)
+    .digest("hex");
+  return path.join(resolvePreferredOpenClawTmpDir(), "openclaw-cli-images", `${digest}${ext}`);
 }
 
 export function appendImagePathsToPrompt(prompt: string, paths: string[]): string {
@@ -222,19 +234,19 @@ export async function loadPromptRefImages(params: {
 export async function writeCliImages(
   images: ImageContent[],
 ): Promise<{ paths: string[]; cleanup: () => Promise<void> }> {
-  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-cli-images-"));
+  const imageRoot = path.join(resolvePreferredOpenClawTmpDir(), "openclaw-cli-images");
+  await fs.mkdir(imageRoot, { recursive: true, mode: 0o700 });
   const paths: string[] = [];
   for (let i = 0; i < images.length; i += 1) {
     const image = images[i];
-    const ext = resolveImageExtension(image.mimeType);
-    const filePath = path.join(tempDir, `image-${i + 1}.${ext}`);
+    const filePath = resolveCliImagePath(image);
     const buffer = Buffer.from(image.data, "base64");
     await fs.writeFile(filePath, buffer, { mode: 0o600 });
     paths.push(filePath);
   }
-  const cleanup = async () => {
-    await fs.rm(tempDir, { recursive: true, force: true });
-  };
+  // Keep content-addressed image paths stable across Claude CLI runs so prompt
+  // text and argv don't churn on every turn with fresh temp-dir suffixes.
+  const cleanup = async () => {};
   return { paths, cleanup };
 }
 
@@ -253,7 +265,7 @@ export function buildCliArgs(params: {
     args.push(params.backend.modelArg, params.modelId);
   }
   if (!params.useResume && params.systemPrompt && params.backend.systemPromptArg) {
-    args.push(params.backend.systemPromptArg, params.systemPrompt);
+    args.push(params.backend.systemPromptArg, stripSystemPromptCacheBoundary(params.systemPrompt));
   }
   if (!params.useResume && params.sessionId) {
     if (params.backend.sessionArgs && params.backend.sessionArgs.length > 0) {

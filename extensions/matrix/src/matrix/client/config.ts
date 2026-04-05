@@ -1,24 +1,12 @@
-import {
-  coerceSecretRef,
-  resolveConfiguredSecretInputString,
-} from "openclaw/plugin-sdk/config-runtime";
 import type { PinnedDispatcherPolicy } from "openclaw/plugin-sdk/infra-runtime";
+import { coerceSecretRef } from "openclaw/plugin-sdk/provider-auth";
+import { normalizeResolvedSecretInputString } from "openclaw/plugin-sdk/secret-input";
 import {
   requiresExplicitMatrixDefaultAccount,
   resolveMatrixDefaultOrOnlyAccountId,
 } from "../../account-selection.js";
 import { resolveMatrixAccountStringValues } from "../../auth-precedence.js";
 import { getMatrixScopedEnvVarNames } from "../../env-vars.js";
-import {
-  DEFAULT_ACCOUNT_ID,
-  assertHttpUrlTargetsPrivateNetwork,
-  isPrivateOrLoopbackHost,
-  type LookupFn,
-  normalizeAccountId,
-  normalizeOptionalAccountId,
-  normalizeResolvedSecretInputString,
-  ssrfPolicyFromAllowPrivateNetwork,
-} from "../../runtime-api.js";
 import { getMatrixRuntime } from "../../runtime.js";
 import type { CoreConfig } from "../../types.js";
 import {
@@ -26,8 +14,17 @@ import {
   resolveMatrixBaseConfig,
   listNormalizedMatrixAccountIds,
 } from "../account-config.js";
-import { resolveMatrixConfigFieldPath } from "../config-update.js";
-import { credentialsMatchConfig, loadMatrixCredentials } from "../credentials-read.js";
+import { resolveMatrixConfigFieldPath } from "../config-paths.js";
+import {
+  DEFAULT_ACCOUNT_ID,
+  assertHttpUrlTargetsPrivateNetwork,
+  isPrivateOrLoopbackHost,
+  isPrivateNetworkOptInEnabled,
+  type LookupFn,
+  normalizeAccountId,
+  normalizeOptionalAccountId,
+  ssrfPolicyFromDangerouslyAllowPrivateNetwork,
+} from "./config-runtime-api.js";
 import type { MatrixAuth, MatrixResolvedConfig } from "./types.js";
 
 type MatrixAuthClientDeps = {
@@ -35,9 +32,35 @@ type MatrixAuthClientDeps = {
   ensureMatrixSdkLoggingConfigured: typeof import("./logging.js").ensureMatrixSdkLoggingConfigured;
 };
 
+type MatrixCredentialsReadDeps = {
+  loadMatrixCredentials: typeof import("../credentials-read.js").loadMatrixCredentials;
+  credentialsMatchConfig: typeof import("../credentials-read.js").credentialsMatchConfig;
+};
+
+type MatrixSecretInputDeps = {
+  resolveConfiguredSecretInputString: typeof import("./config-secret-input.runtime.js").resolveConfiguredSecretInputString;
+};
+
 let matrixAuthClientDepsPromise: Promise<MatrixAuthClientDeps> | undefined;
+let matrixCredentialsReadDepsPromise: Promise<MatrixCredentialsReadDeps> | undefined;
+let matrixSecretInputDepsPromise: Promise<MatrixSecretInputDeps> | undefined;
+let matrixAuthClientDepsForTest: MatrixAuthClientDeps | undefined;
+
+export function setMatrixAuthClientDepsForTest(
+  deps?:
+    | {
+        MatrixClient: typeof import("../sdk.js").MatrixClient;
+        ensureMatrixSdkLoggingConfigured: typeof import("./logging.js").ensureMatrixSdkLoggingConfigured;
+      }
+    | undefined,
+): void {
+  matrixAuthClientDepsForTest = deps;
+}
 
 async function loadMatrixAuthClientDeps(): Promise<MatrixAuthClientDeps> {
+  if (matrixAuthClientDepsForTest) {
+    return matrixAuthClientDepsForTest;
+  }
   matrixAuthClientDepsPromise ??= Promise.all([import("../sdk.js"), import("./logging.js")]).then(
     ([sdkModule, loggingModule]) => ({
       MatrixClient: sdkModule.MatrixClient,
@@ -45,6 +68,23 @@ async function loadMatrixAuthClientDeps(): Promise<MatrixAuthClientDeps> {
     }),
   );
   return await matrixAuthClientDepsPromise;
+}
+
+async function loadMatrixCredentialsReadDeps(): Promise<MatrixCredentialsReadDeps> {
+  matrixCredentialsReadDepsPromise ??= import("../credentials-read.js").then(
+    (credentialsReadModule) => ({
+      loadMatrixCredentials: credentialsReadModule.loadMatrixCredentials,
+      credentialsMatchConfig: credentialsReadModule.credentialsMatchConfig,
+    }),
+  );
+  return await matrixCredentialsReadDepsPromise;
+}
+
+async function loadMatrixSecretInputDeps(): Promise<MatrixSecretInputDeps> {
+  matrixSecretInputDepsPromise ??= import("./config-secret-input.runtime.js").then((runtime) => ({
+    resolveConfiguredSecretInputString: runtime.resolveConfiguredSecretInputString,
+  }));
+  return await matrixSecretInputDepsPromise;
 }
 
 function readEnvSecretRefFallback(params: {
@@ -243,6 +283,7 @@ async function resolveConfiguredMatrixAuthSecretInput(params: {
     return undefined;
   }
 
+  const { resolveConfiguredSecretInputString } = await loadMatrixSecretInputDeps();
   const resolved = await resolveConfiguredSecretInputString({
     config: params.cfg,
     env: params.env,
@@ -319,7 +360,10 @@ function buildMatrixNetworkFields(params: {
   }
   return {
     ...(params.allowPrivateNetwork
-      ? { allowPrivateNetwork: true, ssrfPolicy: ssrfPolicyFromAllowPrivateNetwork(true) }
+      ? {
+          allowPrivateNetwork: true,
+          ssrfPolicy: ssrfPolicyFromDangerouslyAllowPrivateNetwork(true),
+        }
       : {}),
     ...(dispatcherPolicy ? { dispatcherPolicy } : {}),
   };
@@ -460,10 +504,15 @@ export function validateMatrixHomeserverUrl(
 
 export async function resolveValidatedMatrixHomeserverUrl(
   homeserver: string,
-  opts?: { allowPrivateNetwork?: boolean; lookupFn?: LookupFn },
+  opts?: {
+    dangerouslyAllowPrivateNetwork?: boolean;
+    allowPrivateNetwork?: boolean;
+    lookupFn?: LookupFn;
+  },
 ): Promise<string> {
   const normalized = validateMatrixHomeserverUrl(homeserver, opts);
   await assertHttpUrlTargetsPrivateNetwork(normalized, {
+    dangerouslyAllowPrivateNetwork: opts?.dangerouslyAllowPrivateNetwork,
     allowPrivateNetwork: opts?.allowPrivateNetwork,
     lookupFn: opts?.lookupFn,
     errorMessage: MATRIX_HTTP_HOMESERVER_ERROR,
@@ -505,7 +554,7 @@ export function resolveMatrixConfig(
   });
   const initialSyncLimit = clampMatrixInitialSyncLimit(matrix.initialSyncLimit);
   const encryption = matrix.encryption ?? false;
-  const allowPrivateNetwork = matrix.allowPrivateNetwork === true ? true : undefined;
+  const allowPrivateNetwork = isPrivateNetworkOptInEnabled(matrix) ? true : undefined;
   return {
     homeserver: resolvedStrings.homeserver,
     userId: resolvedStrings.userId,
@@ -574,7 +623,9 @@ export function resolveMatrixConfigForAccount(
   const encryption =
     typeof account.encryption === "boolean" ? account.encryption : (matrix.encryption ?? false);
   const allowPrivateNetwork =
-    account.allowPrivateNetwork === true || matrix.allowPrivateNetwork === true ? true : undefined;
+    isPrivateNetworkOptInEnabled(account) || isPrivateNetworkOptInEnabled(matrix)
+      ? true
+      : undefined;
 
   return {
     homeserver: resolvedStrings.homeserver,
@@ -594,12 +645,12 @@ export function resolveMatrixConfigForAccount(
 
 export function resolveImplicitMatrixAccountId(
   cfg: CoreConfig,
-  _env: NodeJS.ProcessEnv = process.env,
+  env: NodeJS.ProcessEnv = process.env,
 ): string | null {
-  if (requiresExplicitMatrixDefaultAccount(cfg)) {
+  if (requiresExplicitMatrixDefaultAccount(cfg, env)) {
     return null;
   }
-  return normalizeAccountId(resolveMatrixDefaultOrOnlyAccountId(cfg));
+  return normalizeAccountId(resolveMatrixDefaultOrOnlyAccountId(cfg, env));
 }
 
 export function resolveMatrixAuthContext(params?: {
@@ -656,7 +707,7 @@ export async function resolveMatrixAuth(params?: {
     })) ?? resolved.accessToken;
   const tokenAuthPassword = resolved.password;
   const homeserver = await resolveValidatedMatrixHomeserverUrl(resolved.homeserver, {
-    allowPrivateNetwork: resolved.allowPrivateNetwork,
+    dangerouslyAllowPrivateNetwork: resolved.allowPrivateNetwork,
   });
   let credentialsWriter: typeof import("../credentials-write.runtime.js") | undefined;
   const loadCredentialsWriter = async () => {
@@ -664,6 +715,7 @@ export async function resolveMatrixAuth(params?: {
     return credentialsWriter;
   };
 
+  const { loadMatrixCredentials, credentialsMatchConfig } = await loadMatrixCredentialsReadDeps();
   const cached = loadMatrixCredentials(env, accountId);
   const cachedCredentials =
     cached &&

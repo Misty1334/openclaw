@@ -1,46 +1,64 @@
 import fs from "node:fs/promises";
+import type { Mock } from "vitest";
 import { beforeEach, vi } from "vitest";
-import { buildAnthropicCliBackend } from "../../extensions/anthropic/test-api.js";
 import { buildGoogleGeminiCliBackend } from "../../extensions/google/test-api.js";
 import { buildOpenAICodexCliBackend } from "../../extensions/openai/test-api.js";
 import type { OpenClawConfig } from "../config/config.js";
+import type { requestHeartbeatNow } from "../infra/heartbeat-wake.js";
+import type { enqueueSystemEvent } from "../infra/system-events.js";
 import { createEmptyPluginRegistry } from "../plugins/registry.js";
 import { setActivePluginRegistry } from "../plugins/runtime.js";
+import type { getProcessSupervisor } from "../process/supervisor/index.js";
 import { setCliRunnerExecuteTestDeps } from "./cli-runner/execute.js";
 import { setCliRunnerPrepareTestDeps } from "./cli-runner/prepare.js";
 import type { EmbeddedContextFile } from "./pi-embedded-helpers.js";
 import type { WorkspaceBootstrapFile } from "./workspace.js";
 
-export const supervisorSpawnMock = vi.fn();
-export const enqueueSystemEventMock = vi.fn();
-export const requestHeartbeatNowMock = vi.fn();
+type ProcessSupervisor = ReturnType<typeof getProcessSupervisor>;
+type SupervisorSpawnFn = ProcessSupervisor["spawn"];
+type EnqueueSystemEventFn = typeof enqueueSystemEvent;
+type RequestHeartbeatNowFn = typeof requestHeartbeatNow;
+type UnknownMock = Mock<(...args: unknown[]) => unknown>;
+type BootstrapContext = {
+  bootstrapFiles: WorkspaceBootstrapFile[];
+  contextFiles: EmbeddedContextFile[];
+};
+type ResolveBootstrapContextForRunMock = Mock<() => Promise<BootstrapContext>>;
+
+export const supervisorSpawnMock: UnknownMock = vi.fn();
+export const enqueueSystemEventMock: UnknownMock = vi.fn();
+export const requestHeartbeatNowMock: UnknownMock = vi.fn();
 export const SMALL_PNG_BASE64 =
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/woAAn8B9FD5fHAAAAAASUVORK5CYII=";
 
-const hoisted = vi.hoisted(() => {
-  type BootstrapContext = {
-    bootstrapFiles: WorkspaceBootstrapFile[];
-    contextFiles: EmbeddedContextFile[];
-  };
-
-  return {
-    resolveBootstrapContextForRunMock: vi.fn<() => Promise<BootstrapContext>>(async () => ({
-      bootstrapFiles: [],
-      contextFiles: [],
-    })),
-  };
-});
+const hoisted = vi.hoisted(
+  (): {
+    resolveBootstrapContextForRunMock: ResolveBootstrapContextForRunMock;
+  } => {
+    return {
+      resolveBootstrapContextForRunMock: vi.fn<() => Promise<BootstrapContext>>(async () => ({
+        bootstrapFiles: [],
+        contextFiles: [],
+      })),
+    };
+  },
+);
 
 setCliRunnerExecuteTestDeps({
   getProcessSupervisor: () => ({
-    spawn: (...args: unknown[]) => supervisorSpawnMock(...args),
+    spawn: (params: Parameters<SupervisorSpawnFn>[0]) =>
+      supervisorSpawnMock(params) as ReturnType<SupervisorSpawnFn>,
     cancel: vi.fn(),
     cancelScope: vi.fn(),
     reconcileOrphans: vi.fn(),
     getRecord: vi.fn(),
   }),
-  enqueueSystemEvent: (...args: unknown[]) => enqueueSystemEventMock(...args),
-  requestHeartbeatNow: (...args: unknown[]) => requestHeartbeatNowMock(...args),
+  enqueueSystemEvent: (
+    text: Parameters<EnqueueSystemEventFn>[0],
+    options: Parameters<EnqueueSystemEventFn>[1],
+  ) => enqueueSystemEventMock(text, options) as ReturnType<EnqueueSystemEventFn>,
+  requestHeartbeatNow: (options?: Parameters<RequestHeartbeatNowFn>[0]) =>
+    requestHeartbeatNowMock(options) as ReturnType<RequestHeartbeatNowFn>,
 });
 
 setCliRunnerPrepareTestDeps({
@@ -71,7 +89,19 @@ type TestCliBackendConfig = {
   clearEnv?: string[];
 };
 
-export function createManagedRun(exit: MockRunExit, pid = 1234) {
+type ManagedRunMock = {
+  runId: string;
+  pid: number;
+  startedAtMs: number;
+  stdin: undefined;
+  wait: Mock<() => Promise<MockRunExit>>;
+  cancel: Mock<() => void>;
+};
+
+export function createManagedRun(
+  exit: MockRunExit,
+  pid = 1234,
+): ManagedRunMock & Awaited<ReturnType<SupervisorSpawnFn>> {
   return {
     runId: "run-supervisor",
     pid,
@@ -118,11 +148,6 @@ export async function setupCliRunnerTestModule() {
   const registry = createEmptyPluginRegistry();
   registry.cliBackends = [
     {
-      pluginId: "anthropic",
-      backend: buildAnthropicCliBackend(),
-      source: "test",
-    },
-    {
       pluginId: "openai",
       backend: buildOpenAICodexCliBackend(),
       source: "test",
@@ -144,20 +169,18 @@ export async function setupCliRunnerTestModule() {
   return (await import("./cli-runner.js")).runCliAgent;
 }
 
-export async function setupClaudeCliRunnerTestModule() {
-  const runCliAgent = await setupCliRunnerTestModule();
-  return (params: Parameters<typeof import("./claude-cli-runner.js").runClaudeCliAgent>[0]) =>
-    runCliAgent({
-      ...params,
-      provider: params.provider ?? "claude-cli",
-    });
-}
-
 export function stubBootstrapContext(params: {
   bootstrapFiles: WorkspaceBootstrapFile[];
   contextFiles: EmbeddedContextFile[];
 }) {
   hoisted.resolveBootstrapContextForRunMock.mockResolvedValueOnce(params);
+}
+
+export function restoreCliRunnerPrepareTestDeps() {
+  setCliRunnerPrepareTestDeps({
+    makeBootstrapWarn: () => () => {},
+    resolveBootstrapContextForRun: hoisted.resolveBootstrapContextForRunMock,
+  });
 }
 
 export async function runCliAgentWithBackendConfig(params: {
@@ -180,7 +203,7 @@ export async function runCliAgentWithBackendConfig(params: {
     } satisfies OpenClawConfig,
     prompt: "hi",
     provider: "codex-cli",
-    model: "gpt-5.2-codex",
+    model: "gpt-5.4",
     timeoutMs: 1_000,
     runId: params.runId,
     cliSessionId: "thread-123",

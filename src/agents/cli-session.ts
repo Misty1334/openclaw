@@ -1,6 +1,5 @@
 import crypto from "node:crypto";
 import type { CliSessionBinding, SessionEntry } from "../config/sessions.js";
-import { CLAUDE_CLI_BACKEND_ID } from "../plugin-sdk/anthropic-cli.js";
 import { normalizeProviderId } from "./model-selection.js";
 
 function trimOptional(value: string | undefined): string | undefined {
@@ -30,6 +29,7 @@ export function getCliSessionBinding(
     return {
       sessionId: bindingSessionId,
       authProfileId: trimOptional(fromBindings?.authProfileId),
+      authEpoch: trimOptional(fromBindings?.authEpoch),
       extraSystemPromptHash: trimOptional(fromBindings?.extraSystemPromptHash),
       mcpConfigHash: trimOptional(fromBindings?.mcpConfigHash),
     };
@@ -37,12 +37,6 @@ export function getCliSessionBinding(
   const fromMap = entry.cliSessionIds?.[normalized];
   if (fromMap?.trim()) {
     return { sessionId: fromMap.trim() };
-  }
-  if (normalized === CLAUDE_CLI_BACKEND_ID) {
-    const legacy = entry.claudeCliSessionId?.trim();
-    if (legacy) {
-      return { sessionId: legacy };
-    }
   }
   return undefined;
 }
@@ -75,6 +69,7 @@ export function setCliSessionBinding(
       ...(trimOptional(binding.authProfileId)
         ? { authProfileId: trimOptional(binding.authProfileId) }
         : {}),
+      ...(trimOptional(binding.authEpoch) ? { authEpoch: trimOptional(binding.authEpoch) } : {}),
       ...(trimOptional(binding.extraSystemPromptHash)
         ? { extraSystemPromptHash: trimOptional(binding.extraSystemPromptHash) }
         : {}),
@@ -84,9 +79,6 @@ export function setCliSessionBinding(
     },
   };
   entry.cliSessionIds = { ...entry.cliSessionIds, [normalized]: trimmed };
-  if (normalized === CLAUDE_CLI_BACKEND_ID) {
-    entry.claudeCliSessionId = trimmed;
-  }
 }
 
 export function clearCliSession(entry: SessionEntry, provider: string): void {
@@ -101,34 +93,39 @@ export function clearCliSession(entry: SessionEntry, provider: string): void {
     delete next[normalized];
     entry.cliSessionIds = Object.keys(next).length > 0 ? next : undefined;
   }
-  if (normalized === CLAUDE_CLI_BACKEND_ID) {
-    delete entry.claudeCliSessionId;
-  }
 }
 
 export function clearAllCliSessions(entry: SessionEntry): void {
   delete entry.cliSessionBindings;
   delete entry.cliSessionIds;
-  delete entry.claudeCliSessionId;
 }
 
 export function resolveCliSessionReuse(params: {
   binding?: CliSessionBinding;
   authProfileId?: string;
+  authEpoch?: string;
   extraSystemPromptHash?: string;
   mcpConfigHash?: string;
-}): { sessionId?: string; invalidatedReason?: "auth-profile" | "system-prompt" | "mcp" } {
+}): {
+  sessionId?: string;
+  invalidatedReason?: "auth-profile" | "auth-epoch" | "system-prompt" | "mcp";
+} {
   const binding = params.binding;
   const sessionId = trimOptional(binding?.sessionId);
   if (!sessionId) {
     return {};
   }
   const currentAuthProfileId = trimOptional(params.authProfileId);
+  const currentAuthEpoch = trimOptional(params.authEpoch);
   const currentExtraSystemPromptHash = trimOptional(params.extraSystemPromptHash);
   const currentMcpConfigHash = trimOptional(params.mcpConfigHash);
   const storedAuthProfileId = trimOptional(binding?.authProfileId);
   if (storedAuthProfileId !== currentAuthProfileId) {
     return { invalidatedReason: "auth-profile" };
+  }
+  const storedAuthEpoch = trimOptional(binding?.authEpoch);
+  if (storedAuthEpoch !== currentAuthEpoch) {
+    return { invalidatedReason: "auth-epoch" };
   }
   const storedExtraSystemPromptHash = trimOptional(binding?.extraSystemPromptHash);
   if (storedExtraSystemPromptHash !== currentExtraSystemPromptHash) {

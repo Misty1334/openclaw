@@ -10,6 +10,7 @@ import {
   makeBootstrapWarn as makeBootstrapWarnImpl,
   resolveBootstrapContextForRun as resolveBootstrapContextForRunImpl,
 } from "../bootstrap-files.js";
+import { resolveCliAuthEpoch } from "../cli-auth-epoch.js";
 import { resolveCliBackendConfig } from "../cli-backends.js";
 import { hashCliSessionText, resolveCliSessionReuse } from "../cli-session.js";
 import { resolveOpenClawDocsPath } from "../docs-path.js";
@@ -59,30 +60,14 @@ export async function prepareCliRunContext(
   if (!backendResolved) {
     throw new Error(`Unknown CLI backend: ${params.provider}`);
   }
-  const preparedBackend = await prepareCliBundleMcpConfig({
-    enabled: backendResolved.bundleMcp,
-    backend: backendResolved.config,
-    workspaceDir,
-    config: params.config,
-    warn: (message) => cliBackendLog.warn(message),
+  const authEpoch = await resolveCliAuthEpoch({
+    provider: params.provider,
+    authProfileId: params.authProfileId,
   });
   const extraSystemPrompt = params.extraSystemPrompt?.trim() ?? "";
   const extraSystemPromptHash = hashCliSessionText(extraSystemPrompt);
-  const reusableCliSession = resolveCliSessionReuse({
-    binding:
-      params.cliSessionBinding ??
-      (params.cliSessionId ? { sessionId: params.cliSessionId } : undefined),
-    authProfileId: params.authProfileId,
-    extraSystemPromptHash,
-    mcpConfigHash: preparedBackend.mcpConfigHash,
-  });
-  if (reusableCliSession.invalidatedReason) {
-    cliBackendLog.info(
-      `cli session reset: provider=${params.provider} reason=${reusableCliSession.invalidatedReason}`,
-    );
-  }
   const modelId = (params.model ?? "default").trim() || "default";
-  const normalizedModel = normalizeCliModel(modelId, preparedBackend.backend);
+  const normalizedModel = normalizeCliModel(modelId, backendResolved.config);
   const modelDisplay = `${params.provider}/${modelId}`;
 
   const sessionLabel = params.sessionKey ?? params.sessionId;
@@ -118,6 +103,27 @@ export async function prepareCliRunContext(
     config: params.config,
     agentId: params.agentId,
   });
+  const preparedBackend = await prepareCliBundleMcpConfig({
+    enabled: backendResolved.bundleMcp,
+    backend: backendResolved.config,
+    workspaceDir,
+    config: params.config,
+    warn: (message) => cliBackendLog.warn(message),
+  });
+  const reusableCliSession = resolveCliSessionReuse({
+    binding:
+      params.cliSessionBinding ??
+      (params.cliSessionId ? { sessionId: params.cliSessionId } : undefined),
+    authProfileId: params.authProfileId,
+    authEpoch,
+    extraSystemPromptHash,
+    mcpConfigHash: preparedBackend.mcpConfigHash,
+  });
+  if (reusableCliSession.invalidatedReason) {
+    cliBackendLog.info(
+      `cli session reset: provider=${params.provider} reason=${reusableCliSession.invalidatedReason}`,
+    );
+  }
   const heartbeatPrompt =
     sessionAgentId === defaultAgentId
       ? resolveHeartbeatPrompt(params.config?.agents?.defaults?.heartbeat?.prompt)
@@ -140,6 +146,7 @@ export async function prepareCliRunContext(
     contextFiles,
     modelDisplay,
     agentId: sessionAgentId,
+    backendId: backendResolved.id,
   });
   const systemPromptReport = buildSystemPromptReport({
     source: "run",
@@ -177,6 +184,7 @@ export async function prepareCliRunContext(
     systemPromptReport,
     bootstrapPromptWarningLines: bootstrapPromptWarning.lines,
     heartbeatPrompt,
+    authEpoch,
     extraSystemPromptHash,
   };
 }

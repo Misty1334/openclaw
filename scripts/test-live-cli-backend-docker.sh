@@ -9,16 +9,12 @@ CONFIG_DIR="${OPENCLAW_CONFIG_DIR:-$HOME/.openclaw}"
 WORKSPACE_DIR="${OPENCLAW_WORKSPACE_DIR:-$HOME/.openclaw/workspace}"
 PROFILE_FILE="${OPENCLAW_PROFILE_FILE:-$HOME/.profile}"
 CLI_TOOLS_DIR="${OPENCLAW_DOCKER_CLI_TOOLS_DIR:-$HOME/.cache/openclaw/docker-cli-tools}"
-DEFAULT_MODEL="claude-cli/claude-sonnet-4-6"
+DEFAULT_MODEL="codex-cli/gpt-5.4"
 CLI_MODEL="${OPENCLAW_LIVE_CLI_BACKEND_MODEL:-$DEFAULT_MODEL}"
 CLI_PROVIDER="${CLI_MODEL%%/*}"
-CLI_DISABLE_MCP_CONFIG="${OPENCLAW_LIVE_CLI_BACKEND_DISABLE_MCP_CONFIG:-}"
 
 if [[ -z "$CLI_PROVIDER" || "$CLI_PROVIDER" == "$CLI_MODEL" ]]; then
-  CLI_PROVIDER="claude-cli"
-fi
-if [[ "$CLI_PROVIDER" == "claude-cli" && -z "$CLI_DISABLE_MCP_CONFIG" ]]; then
-  CLI_DISABLE_MCP_CONFIG="0"
+  CLI_PROVIDER="codex-cli"
 fi
 
 mkdir -p "$CLI_TOOLS_DIR"
@@ -29,52 +25,87 @@ if [[ -f "$PROFILE_FILE" ]]; then
 fi
 
 AUTH_DIRS=()
+AUTH_FILES=()
 if [[ -n "${OPENCLAW_DOCKER_AUTH_DIRS:-}" ]]; then
   while IFS= read -r auth_dir; do
     [[ -n "$auth_dir" ]] || continue
     AUTH_DIRS+=("$auth_dir")
   done < <(openclaw_live_collect_auth_dirs)
+  while IFS= read -r auth_file; do
+    [[ -n "$auth_file" ]] || continue
+    AUTH_FILES+=("$auth_file")
+  done < <(openclaw_live_collect_auth_files)
 else
   while IFS= read -r auth_dir; do
     [[ -n "$auth_dir" ]] || continue
     AUTH_DIRS+=("$auth_dir")
   done < <(openclaw_live_collect_auth_dirs_from_csv "$CLI_PROVIDER")
+  while IFS= read -r auth_file; do
+    [[ -n "$auth_file" ]] || continue
+    AUTH_FILES+=("$auth_file")
+  done < <(openclaw_live_collect_auth_files_from_csv "$CLI_PROVIDER")
 fi
-AUTH_DIRS_CSV="$(openclaw_live_join_csv "${AUTH_DIRS[@]}")"
+AUTH_DIRS_CSV=""
+if ((${#AUTH_DIRS[@]} > 0)); then
+  AUTH_DIRS_CSV="$(openclaw_live_join_csv "${AUTH_DIRS[@]}")"
+fi
+AUTH_FILES_CSV=""
+if ((${#AUTH_FILES[@]} > 0)); then
+  AUTH_FILES_CSV="$(openclaw_live_join_csv "${AUTH_FILES[@]}")"
+fi
 
 EXTERNAL_AUTH_MOUNTS=()
-for auth_dir in "${AUTH_DIRS[@]}"; do
-  host_path="$HOME/$auth_dir"
-  if [[ -d "$host_path" ]]; then
-    EXTERNAL_AUTH_MOUNTS+=(-v "$host_path":/host-auth/"$auth_dir":ro)
-  fi
-done
+if ((${#AUTH_DIRS[@]} > 0)); then
+  for auth_dir in "${AUTH_DIRS[@]}"; do
+    host_path="$HOME/$auth_dir"
+    if [[ -d "$host_path" ]]; then
+      EXTERNAL_AUTH_MOUNTS+=(-v "$host_path":/host-auth/"$auth_dir":ro)
+    fi
+  done
+fi
+if ((${#AUTH_FILES[@]} > 0)); then
+  for auth_file in "${AUTH_FILES[@]}"; do
+    host_path="$HOME/$auth_file"
+    if [[ -f "$host_path" ]]; then
+      EXTERNAL_AUTH_MOUNTS+=(-v "$host_path":/host-auth-files/"$auth_file":ro)
+    fi
+  done
+fi
 
 read -r -d '' LIVE_TEST_CMD <<'EOF' || true
 set -euo pipefail
 [ -f "$HOME/.profile" ] && source "$HOME/.profile" || true
 export PATH="$HOME/.npm-global/bin:$PATH"
 IFS=',' read -r -a auth_dirs <<<"${OPENCLAW_DOCKER_AUTH_DIRS_RESOLVED:-}"
-for auth_dir in "${auth_dirs[@]}"; do
-  [ -n "$auth_dir" ] || continue
-  if [ -d "/host-auth/$auth_dir" ]; then
-    mkdir -p "$HOME/$auth_dir"
-    cp -R "/host-auth/$auth_dir/." "$HOME/$auth_dir"
-    chmod -R u+rwX "$HOME/$auth_dir" || true
-  fi
-done
-provider="${OPENCLAW_DOCKER_CLI_BACKEND_PROVIDER:-claude-cli}"
-if [ "$provider" = "claude-cli" ]; then
+IFS=',' read -r -a auth_files <<<"${OPENCLAW_DOCKER_AUTH_FILES_RESOLVED:-}"
+if ((${#auth_dirs[@]} > 0)); then
+  for auth_dir in "${auth_dirs[@]}"; do
+    [ -n "$auth_dir" ] || continue
+    if [ -d "/host-auth/$auth_dir" ]; then
+      mkdir -p "$HOME/$auth_dir"
+      cp -R "/host-auth/$auth_dir/." "$HOME/$auth_dir"
+      chmod -R u+rwX "$HOME/$auth_dir" || true
+    fi
+  done
+fi
+if ((${#auth_files[@]} > 0)); then
+  for auth_file in "${auth_files[@]}"; do
+    [ -n "$auth_file" ] || continue
+    if [ -f "/host-auth-files/$auth_file" ]; then
+      mkdir -p "$(dirname "$HOME/$auth_file")"
+      cp "/host-auth-files/$auth_file" "$HOME/$auth_file"
+      chmod u+rw "$HOME/$auth_file" || true
+    fi
+  done
+fi
+provider="${OPENCLAW_DOCKER_CLI_BACKEND_PROVIDER:-codex-cli}"
+if [ "$provider" = "codex-cli" ]; then
   if [ -z "${OPENCLAW_LIVE_CLI_BACKEND_COMMAND:-}" ]; then
-    export OPENCLAW_LIVE_CLI_BACKEND_COMMAND="$HOME/.npm-global/bin/claude"
+    export OPENCLAW_LIVE_CLI_BACKEND_COMMAND="$HOME/.npm-global/bin/codex"
   fi
   if [ ! -x "${OPENCLAW_LIVE_CLI_BACKEND_COMMAND}" ]; then
-    npm_config_prefix="$HOME/.npm-global" npm install -g @anthropic-ai/claude-code
+    npm_config_prefix="$HOME/.npm-global" npm install -g @openai/codex
   fi
-  if [ -z "${OPENCLAW_LIVE_CLI_BACKEND_PRESERVE_ENV:-}" ]; then
-    export OPENCLAW_LIVE_CLI_BACKEND_PRESERVE_ENV='["ANTHROPIC_API_KEY","ANTHROPIC_API_KEY_OLD"]'
-  fi
-  claude auth status || true
 fi
 tmp_dir="$(mktemp -d)"
 cleanup() {
@@ -106,17 +137,18 @@ echo "==> Run CLI backend live test in Docker"
 echo "==> Model: $CLI_MODEL"
 echo "==> Provider: $CLI_PROVIDER"
 echo "==> External auth dirs: ${AUTH_DIRS_CSV:-none}"
+echo "==> External auth files: ${AUTH_FILES_CSV:-none}"
 docker run --rm -t \
   -u node \
   --entrypoint bash \
-  -e ANTHROPIC_API_KEY \
-  -e ANTHROPIC_API_KEY_OLD \
+  -e OPENAI_API_KEY \
   -e COREPACK_ENABLE_DOWNLOAD_PROMPT=0 \
   -e HOME=/home/node \
   -e NODE_OPTIONS=--disable-warning=ExperimentalWarning \
   -e OPENCLAW_SKIP_CHANNELS=1 \
   -e OPENCLAW_VITEST_FS_MODULE_CACHE=0 \
   -e OPENCLAW_DOCKER_AUTH_DIRS_RESOLVED="$AUTH_DIRS_CSV" \
+  -e OPENCLAW_DOCKER_AUTH_FILES_RESOLVED="$AUTH_FILES_CSV" \
   -e OPENCLAW_DOCKER_CLI_BACKEND_PROVIDER="$CLI_PROVIDER" \
   -e OPENCLAW_LIVE_TEST=1 \
   -e OPENCLAW_LIVE_CLI_BACKEND=1 \
@@ -125,7 +157,6 @@ docker run --rm -t \
   -e OPENCLAW_LIVE_CLI_BACKEND_ARGS="${OPENCLAW_LIVE_CLI_BACKEND_ARGS:-}" \
   -e OPENCLAW_LIVE_CLI_BACKEND_CLEAR_ENV="${OPENCLAW_LIVE_CLI_BACKEND_CLEAR_ENV:-}" \
   -e OPENCLAW_LIVE_CLI_BACKEND_PRESERVE_ENV="${OPENCLAW_LIVE_CLI_BACKEND_PRESERVE_ENV:-}" \
-  -e OPENCLAW_LIVE_CLI_BACKEND_DISABLE_MCP_CONFIG="$CLI_DISABLE_MCP_CONFIG" \
   -e OPENCLAW_LIVE_CLI_BACKEND_RESUME_PROBE="${OPENCLAW_LIVE_CLI_BACKEND_RESUME_PROBE:-}" \
   -e OPENCLAW_LIVE_CLI_BACKEND_IMAGE_PROBE="${OPENCLAW_LIVE_CLI_BACKEND_IMAGE_PROBE:-}" \
   -e OPENCLAW_LIVE_CLI_BACKEND_IMAGE_ARG="${OPENCLAW_LIVE_CLI_BACKEND_IMAGE_ARG:-}" \
