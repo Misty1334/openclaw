@@ -1,85 +1,85 @@
+// Stores task registry records in memory and bridges persistence runtime hooks.
 import {
-  closeTaskRegistrySqliteStore,
-  deleteTaskDeliveryStateFromSqlite,
-  deleteTaskRegistryRecordFromSqlite,
+  closeTaskRegistryDatabase,
+  deleteTaskAndDeliveryStateFromSqlite,
   loadTaskRegistryStateFromSqlite,
-  saveTaskRegistryStateToSqlite,
+  listTaskRegistryRecordsByOwnerKeyFromSqlite,
+  upsertTaskWithDeliveryStateToSqlite,
   upsertTaskDeliveryStateToSqlite,
-  upsertTaskRegistryRecordToSqlite,
 } from "./task-registry.store.sqlite.js";
+import type { TaskRegistryStoreSnapshot } from "./task-registry.store.types.js";
 import type { TaskDeliveryState, TaskRecord } from "./task-registry.types.js";
 
-export type TaskRegistryStoreSnapshot = {
-  tasks: Map<string, TaskRecord>;
-  deliveryStates: Map<string, TaskDeliveryState>;
-};
+export type { TaskRegistryStoreSnapshot } from "./task-registry.store.types.js";
 
 export type TaskRegistryStore = {
   loadSnapshot: () => TaskRegistryStoreSnapshot;
-  saveSnapshot: (snapshot: TaskRegistryStoreSnapshot) => void;
-  upsertTask?: (task: TaskRecord) => void;
-  deleteTask?: (taskId: string) => void;
-  upsertDeliveryState?: (state: TaskDeliveryState) => void;
-  deleteDeliveryState?: (taskId: string) => void;
+  listTasksForOwnerKey?: (ownerKey: string) => TaskRecord[];
+  upsertTaskWithDeliveryState: (params: {
+    task: TaskRecord;
+    deliveryState?: TaskDeliveryState;
+  }) => void;
+  deleteTaskWithDeliveryState: (taskId: string) => void;
+  upsertDeliveryState: (state: TaskDeliveryState) => void;
   close?: () => void;
 };
 
-export type TaskRegistryHookEvent =
+type TaskRegistryObserverRecord = Omit<TaskRecord, "detail">;
+
+export type TaskRegistryObserverEvent =
   | {
       kind: "restored";
-      tasks: TaskRecord[];
     }
   | {
       kind: "upserted";
-      task: TaskRecord;
-      previous?: TaskRecord;
+      task: TaskRegistryObserverRecord;
+      previous?: TaskRegistryObserverRecord;
     }
   | {
       kind: "deleted";
       taskId: string;
-      previous: TaskRecord;
+      previous: TaskRegistryObserverRecord;
     };
 
-export type TaskRegistryHooks = {
-  // Hooks are incremental/observational. Snapshot persistence belongs to TaskRegistryStore.
-  onEvent?: (event: TaskRegistryHookEvent) => void;
+type TaskRegistryObservers = {
+  // Observers are incremental/best-effort only. Persistence belongs to TaskRegistryStore.
+  onEvent?: (event: TaskRegistryObserverEvent) => void;
 };
 
 const defaultTaskRegistryStore: TaskRegistryStore = {
   loadSnapshot: loadTaskRegistryStateFromSqlite,
-  saveSnapshot: saveTaskRegistryStateToSqlite,
-  upsertTask: upsertTaskRegistryRecordToSqlite,
-  deleteTask: deleteTaskRegistryRecordFromSqlite,
+  listTasksForOwnerKey: listTaskRegistryRecordsByOwnerKeyFromSqlite,
+  upsertTaskWithDeliveryState: upsertTaskWithDeliveryStateToSqlite,
+  deleteTaskWithDeliveryState: deleteTaskAndDeliveryStateFromSqlite,
   upsertDeliveryState: upsertTaskDeliveryStateToSqlite,
-  deleteDeliveryState: deleteTaskDeliveryStateFromSqlite,
-  close: closeTaskRegistrySqliteStore,
+  close: closeTaskRegistryDatabase,
 };
 
 let configuredTaskRegistryStore: TaskRegistryStore = defaultTaskRegistryStore;
-let configuredTaskRegistryHooks: TaskRegistryHooks | null = null;
+let configuredTaskRegistryObservers: TaskRegistryObservers | null = null;
 
 export function getTaskRegistryStore(): TaskRegistryStore {
   return configuredTaskRegistryStore;
 }
 
-export function getTaskRegistryHooks(): TaskRegistryHooks | null {
-  return configuredTaskRegistryHooks;
+export function getTaskRegistryObservers(): TaskRegistryObservers | null {
+  return configuredTaskRegistryObservers;
 }
 
 export function configureTaskRegistryRuntime(params: {
   store?: TaskRegistryStore;
-  hooks?: TaskRegistryHooks | null;
+  observers?: TaskRegistryObservers | null;
 }) {
   if (params.store) {
     configuredTaskRegistryStore = params.store;
   }
-  if ("hooks" in params) {
-    configuredTaskRegistryHooks = params.hooks ?? null;
+  if ("observers" in params) {
+    configuredTaskRegistryObservers = params.observers ?? null;
   }
 }
 
 export function resetTaskRegistryRuntimeForTests() {
   configuredTaskRegistryStore.close?.();
   configuredTaskRegistryStore = defaultTaskRegistryStore;
-  configuredTaskRegistryHooks = null;
+  configuredTaskRegistryObservers = null;
 }
